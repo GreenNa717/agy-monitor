@@ -1,6 +1,6 @@
 {
   "name": "agy-monitor",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "type": "module",
   "license": "MIT",
   "description": "AGY Console (AGY 控制台): Antigravity context telemetry, token usage, multi-agent Mastery tracker, and theme/backdrop studio.",

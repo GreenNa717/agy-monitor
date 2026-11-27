@@ -1,7 +1,7 @@
 {
   "name": "agy-monitor",
   "displayName": "AGY 控制台",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Antigravity 全功能侧边控制台：实时上下文与 Token 遥测、官方 5h 与周配额实时看板、多 Agent 协作网与类 Codex 历程追踪（掌握）、多账号安全管理与自动切号（账号）、撞色主题与整机壁纸美化（美化）、可插拔 AI 桌宠工作室（桌宠）。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

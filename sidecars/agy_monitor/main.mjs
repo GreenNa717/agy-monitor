@@ -2357,6 +2357,7 @@ export function createMonitorHandlers({
       return {
         ok: Boolean(actionResult.ok || cdpStatus?.hudInjected),
         diskWritten: Boolean(actionResult.diskWritten),
+        queuedForExit: Boolean(actionResult.queuedForExit),
         pendingRestart: Boolean(actionResult.pendingRestart),
         hotInjected: Boolean(cdpStatus?.hudInjected),
         alreadyUpToDate: Boolean(actionResult.alreadyUpToDate),
@@ -2377,6 +2378,7 @@ export function createMonitorHandlers({
       return {
         ok: Boolean(actionResult.ok),
         diskWritten: Boolean(actionResult.diskWritten),
+        queuedForExit: Boolean(actionResult.queuedForExit),
         pendingRestart: Boolean(actionResult.pendingRestart),
         error: actionResult.error || '',
         nativeHud,

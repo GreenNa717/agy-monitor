@@ -489,7 +489,9 @@ export const DICT = Object.freeze({
     'nativeHud.descUia': '当前为旧版外部浮窗，建议切换为「原生持久」。',
     'nativeHud.toastInstalled': '状态栏已生效',
     'nativeHud.toastInstalledPending': '已保存配置，重启软件后生效',
+    'nativeHud.toastQueuedExit': '已备好新版补丁，关闭并重启 Antigravity 后自动生效',
     'nativeHud.toastRestored': '已还原默认状态',
+    'nativeHud.toastRestoreQueued': '已备好原版文件，关闭 Antigravity 后将自动完成还原',
     'nativeHud.toastModeSwitched': '状态栏方式已更新',
 
     'theme.languageTitle': '主窗口语言',
@@ -1004,7 +1006,9 @@ export const DICT = Object.freeze({
     'nativeHud.descUia': 'Using legacy Win32 + UIA overlay; switch back to Persistent Inject to eliminate drift/occlusion.',
     'nativeHud.toastInstalled': 'Native DOM HUD injected and active',
     'nativeHud.toastInstalledPending': 'Written to app.asar; restart Antigravity to activate natively',
+    'nativeHud.toastQueuedExit': 'Patch staged; close and reopen Antigravity to apply automatically',
     'nativeHud.toastRestored': 'Restored stock app.asar and unmounted native HUD',
+    'nativeHud.toastRestoreQueued': 'Stock app.asar staged; close Antigravity to finish restoring',
     'nativeHud.toastModeSwitched': 'HUD mount mode updated',
 
     'theme.languageTitle': 'Host UI Language',

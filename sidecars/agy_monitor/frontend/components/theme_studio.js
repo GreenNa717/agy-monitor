@@ -811,7 +811,7 @@ export function createThemeStudio({
     const cdpStyleLive = Boolean(cdp.styleApplied);
     const cdpTransport = String(cdp.transport || "direct");
     const nativeWpAlive = Boolean(nh.heartbeat?.wallpaperAlive);
-    const asarInstalledWp = nh.state === "installed";
+    const asarInstalledWp = nh.state === "installed" || nh.pendingApply?.action === "install";
     const asarVerWp = nh.installedVersion || nh.currentVersion || "2.1.0";
     const quickCmd = isCdp
       ? (typeof cdp.launchCommand === "string" ? cdp.launchCommand : "")
@@ -1037,7 +1037,7 @@ export function createThemeStudio({
     const autoReinject = state.hudAutoReinject !== false;
     const nativeAlive = Boolean(nh.heartbeat?.alive);
     const cdpHudLive = Boolean(cdp.hudInjected);
-    const asarInstalled = nh.state === "installed";
+    const asarInstalled = nh.state === "installed" || nh.pendingApply?.action === "install";
     const ver = nh.installedVersion || nh.currentVersion || "2.0.0";
 
     if (nativeHudEnableBtn) {
@@ -2317,6 +2317,15 @@ export function createThemeStudio({
         renderBackdropCompanion();
         if (res?.hotInjected || res?.nativeHud?.heartbeat?.alive) {
           onToast?.(tr("nativeHud.toastInstalled", "原生 DOM 状态栏已注入并生效", "Native DOM HUD injected and active"), "success");
+        } else if (res?.queuedForExit) {
+          onToast?.(
+            tr(
+              "nativeHud.toastQueuedExit",
+              "已备好新版补丁，关闭并重启 Antigravity 后自动生效",
+              "Patch staged; close and reopen Antigravity to apply automatically"
+            ),
+            "success"
+          );
         } else if (res?.diskWritten) {
           onToast?.(tr("nativeHud.toastInstalledPending", "已写入 app.asar 持久化，重启 Antigravity 后原生生效", "Written to app.asar; restart Antigravity to activate natively"), "success");
         } else if (res?.error) {
@@ -2346,7 +2355,14 @@ export function createThemeStudio({
         };
         renderBackdropCompanion();
         onToast?.(
-          res?.error || tr("nativeHud.toastRestored", "已还原官方纯净 app.asar 并卸载原生状态栏", "Restored stock app.asar and unmounted native HUD"),
+          res?.error ||
+            (res?.queuedForExit
+              ? tr(
+                  "nativeHud.toastRestoreQueued",
+                  "已备好原版文件，关闭 Antigravity 后将自动完成还原",
+                  "Stock app.asar staged; close Antigravity to finish restoring"
+                )
+              : tr("nativeHud.toastRestored", "已还原官方纯净 app.asar 并卸载原生状态栏", "Restored stock app.asar and unmounted native HUD")),
           res?.ok ? "success" : "info"
         );
       } catch (err) {

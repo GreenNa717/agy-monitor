@@ -13,6 +13,16 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.2.3",
+    date: "2026-11-28",
+    title: "修复 Antigravity 升级后美化失效死锁（新增独立退出原子落盘进程）",
+    items: [
+      "彻底修复 Windows 上 Antigravity 自身升级覆盖 app.asar 后，运行态文件锁（EBUSY/EPERM）导致原生壁纸、状态栏、深度汉化与免 TUN 代理无法自动重注的死锁问题。",
+      "新增零依赖独立退出落盘进程 asar_apply_worker.mjs：永不就地覆写运行中的 app.asar；遇到占用锁时自动暂存完整补丁并在客户端关闭释放句柄的瞬间完成 SHA-256 与指纹校验及 0.1ms 原子替换（若期间官方再次更新则自动放弃防覆盖），重启后自动清理残留文件。",
+      "美化页状态徽章与操作提示同步适配延迟落盘状态，排队就绪后直接展示「已持久化 · 重启生效」并给出清晰引导。",
+    ],
+  },
+  {
     version: "1.2.2",
     date: "2026-11-27",
     title: "主窗口深度中文汉化 v2、新增「增强」加速分页与「免 TUN 代理」、多账号跨平台加固 & app.asar 安全防护",

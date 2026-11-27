@@ -1,9 +1,11 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import nodeFs from 'node:fs';
 import nodeFsp from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { atomicWriteJson, atomicWriteText } from './paths.mjs';
 import {
   buildHostI18nRestoreExpr,
@@ -14,6 +16,8 @@ import {
 import { detectWindowsHostEnv, resolveWindowsHostDirs } from './wsl_bridge.mjs';
 
 const _require = createRequire(import.meta.url);
+const __hudDirname = path.dirname(fileURLToPath(import.meta.url));
+const ASAR_APPLY_WORKER_PATH = path.resolve(__hudDirname, 'asar_apply_worker.mjs');
 
 // Inside Electron's ELECTRON_RUN_AS_NODE sidecar runtime, standard `node:fs` intercepts
 // `.asar` paths as virtual directories and throws `ENOENT, not found in .../app.asar`.
@@ -2915,6 +2919,21 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
     }
   }
 
+  function cleanupStaleAsarFiles() {
+    try {
+      let rawFs = fs;
+      try { rawFs = require('original-fs'); } catch {}
+      const resDir = typeof process.resourcesPath === 'string' ? process.resourcesPath : '';
+      if (!resDir || !rawFs.existsSync(resDir)) return;
+      for (const name of rawFs.readdirSync(resDir)) {
+        if (/^app\.asar\.agy_(?:stale|tmp)(?:\..+)?$/i.test(name)) {
+          try { rawFs.unlinkSync(path.join(resDir, name)); } catch {}
+        }
+      }
+    } catch {}
+  }
+  cleanupStaleAsarFiles();
+
   if (!isPluginInstalled()) {
     try {
       if (fs.existsSync(STATUS_FILE)) fs.unlinkSync(STATUS_FILE);
@@ -3754,82 +3773,126 @@ function isAsarLockError(err) {
   return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'ETXTBSY';
 }
 
-// Safely replace app.asar ONLY when unlocked: probe write access first, stage to a sibling
-// temp file, verify byte length, then atomically rename into place. Never rename-swap a locked
-// live app.asar to .agy_stale under a running Electron process.
-export async function writeAsarSafely(targetPath, dataBuf) {
-  const staleTmp = `${targetPath}.agy_stale`;
-  let targetExists = false;
-  try {
-    const fh = await fsp.open(targetPath, 'r+');
-    targetExists = true;
-    await fh.close().catch(() => {});
-  } catch (probeErr) {
-    if (probeErr?.code !== 'ENOENT') {
-      return {
-        ok: false,
-        locked: isAsarLockError(probeErr),
-        error: probeErr?.message || String(probeErr),
-      };
-    }
-  }
+function escapeRegExpLiteral(str) {
+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-  const tmpPath = `${targetPath}.agy_tmp.${process.pid}.${Date.now()}`;
+function makeStaleSiblingRegex(targetPath) {
+  const base = escapeRegExpLiteral(path.basename(targetPath));
+  return new RegExp(`^${base}\\.agy_(?:stale|tmp)(?:\\..+)?$`, 'i');
+}
+
+async function cleanupStaleAsarSiblings(targetPath, skipNames = new Set()) {
+  try {
+    const dir = path.dirname(targetPath);
+    const re = makeStaleSiblingRegex(targetPath);
+    const entries = await fsp.readdir(dir);
+    for (const name of entries) {
+      if (skipNames.has(name) || !re.test(name)) continue;
+      await fsp.rm(path.join(dir, name), { force: true }).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function cleanupStaleAsarSiblingsSync(targetPath, skipNames = new Set()) {
+  try {
+    const dir = path.dirname(targetPath);
+    const re = makeStaleSiblingRegex(targetPath);
+    const entries = fs.readdirSync(dir);
+    for (const name of entries) {
+      if (skipNames.has(name) || !re.test(name)) continue;
+      try {
+        fs.rmSync(path.join(dir, name), { force: true });
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+// Safely replace app.asar WITHOUT ever truncating/overwriting an open file in-place:
+// 1. Always stage full verified bytes to a sibling temp file first.
+// 2. Try direct atomic rename(tmp -> target) when target is unlocked / offline.
+// 3. On Windows while Electron holds an open handle to app.asar (FILE_SHARE_DELETE),
+//    direct rename(tmp -> target) fails with EPERM/EBUSY. Perform a zero-truncation
+//    two-step atomic inode swap: rename(target -> stale) + rename(tmp -> target).
+//    The running Electron process continues reading the untouched original inode safely,
+//    while the next launch immediately loads the verified new app.asar and cleans stale files.
+export async function writeAsarSafely(targetPath, dataBuf, { allowInodeSwap = true } = {}) {
+  const stamp = `${process.pid}.${Date.now()}`;
+  const tmpPath = `${targetPath}.agy_tmp.${stamp}`;
   try {
     await fsp.writeFile(tmpPath, dataBuf);
     const st = await fsp.stat(tmpPath);
     if (st.size !== dataBuf.length) {
       throw new Error(`临时 ASAR 写入不完整 (${st.size}/${dataBuf.length})`);
     }
-    await fsp.rename(tmpPath, targetPath);
-    await fsp.rm(staleTmp, { force: true }).catch(() => {});
-    return { ok: true, method: targetExists ? 'atomic_replace' : 'atomic_create' };
-  } catch (err) {
+  } catch (stageErr) {
     await fsp.rm(tmpPath, { force: true }).catch(() => {});
     return {
       ok: false,
-      locked: isAsarLockError(err),
-      error: err?.message || String(err),
+      locked: isAsarLockError(stageErr),
+      error: stageErr?.message || String(stageErr),
     };
+  }
+
+  try {
+    await fsp.rename(tmpPath, targetPath);
+    await cleanupStaleAsarSiblings(targetPath);
+    return { ok: true, method: 'atomic_replace' };
+  } catch (replaceErr) {
+    if (!allowInodeSwap || !isAsarLockError(replaceErr)) {
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      return {
+        ok: false,
+        locked: isAsarLockError(replaceErr),
+        error: replaceErr?.message || String(replaceErr),
+      };
+    }
+
+    const stalePath = `${targetPath}.agy_stale.${stamp}`;
+    try {
+      await fsp.rename(targetPath, stalePath);
+    } catch (moveOldErr) {
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      return {
+        ok: false,
+        locked: isAsarLockError(moveOldErr) || isAsarLockError(replaceErr),
+        error: moveOldErr?.message || replaceErr?.message || String(replaceErr),
+      };
+    }
+
+    try {
+      await fsp.rename(tmpPath, targetPath);
+    } catch (moveNewErr) {
+      await fsp.rename(stalePath, targetPath).catch(() => {});
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      return {
+        ok: false,
+        locked: isAsarLockError(moveNewErr),
+        error: moveNewErr?.message || String(moveNewErr),
+      };
+    }
+
+    await cleanupStaleAsarSiblings(targetPath);
+    return { ok: true, method: 'atomic_inode_swap' };
   }
 }
 
-function writeAsarSafelySync(targetPath, dataBuf) {
-  const staleTmp = `${targetPath}.agy_stale`;
-  let targetExists = false;
-  try {
-    const fd = fs.openSync(targetPath, 'r+');
-    targetExists = true;
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // ignore
-    }
-  } catch (probeErr) {
-    if (probeErr?.code !== 'ENOENT') {
-      return {
-        ok: false,
-        locked: isAsarLockError(probeErr),
-        error: probeErr?.message || String(probeErr),
-      };
-    }
-  }
-
-  const tmpPath = `${targetPath}.agy_tmp.${process.pid}.${Date.now()}`;
+function writeAsarSafelySync(targetPath, dataBuf, { allowInodeSwap = true } = {}) {
+  const stamp = `${process.pid}.${Date.now()}`;
+  const tmpPath = `${targetPath}.agy_tmp.${stamp}`;
   try {
     fs.writeFileSync(tmpPath, dataBuf);
     const st = fs.statSync(tmpPath);
     if (st.size !== dataBuf.length) {
       throw new Error(`临时 ASAR 写入不完整 (${st.size}/${dataBuf.length})`);
     }
-    fs.renameSync(tmpPath, targetPath);
-    try {
-      fs.rmSync(staleTmp, { force: true });
-    } catch {
-      // ignore
-    }
-    return { ok: true, method: targetExists ? 'atomic_replace' : 'atomic_create' };
-  } catch (err) {
+  } catch (stageErr) {
     try {
       fs.rmSync(tmpPath, { force: true });
     } catch {
@@ -3837,9 +3900,67 @@ function writeAsarSafelySync(targetPath, dataBuf) {
     }
     return {
       ok: false,
-      locked: isAsarLockError(err),
-      error: err?.message || String(err),
+      locked: isAsarLockError(stageErr),
+      error: stageErr?.message || String(stageErr),
     };
+  }
+
+  try {
+    fs.renameSync(tmpPath, targetPath);
+    cleanupStaleAsarSiblingsSync(targetPath);
+    return { ok: true, method: 'atomic_replace' };
+  } catch (replaceErr) {
+    if (!allowInodeSwap || !isAsarLockError(replaceErr)) {
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        // ignore
+      }
+      return {
+        ok: false,
+        locked: isAsarLockError(replaceErr),
+        error: replaceErr?.message || String(replaceErr),
+      };
+    }
+
+    const stalePath = `${targetPath}.agy_stale.${stamp}`;
+    try {
+      fs.renameSync(targetPath, stalePath);
+    } catch (moveOldErr) {
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        // ignore
+      }
+      return {
+        ok: false,
+        locked: isAsarLockError(moveOldErr) || isAsarLockError(replaceErr),
+        error: moveOldErr?.message || replaceErr?.message || String(replaceErr),
+      };
+    }
+
+    try {
+      fs.renameSync(tmpPath, targetPath);
+    } catch (moveNewErr) {
+      try {
+        fs.renameSync(stalePath, targetPath);
+      } catch {
+        // ignore
+      }
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        // ignore
+      }
+      return {
+        ok: false,
+        locked: isAsarLockError(moveNewErr),
+        error: moveNewErr?.message || String(moveNewErr),
+      };
+    }
+
+    cleanupStaleAsarSiblingsSync(targetPath);
+    return { ok: true, method: 'atomic_inode_swap' };
   }
 }
 
@@ -3850,6 +3971,234 @@ function resolveBackupPaths(paths) {
     bakPath: path.join(backupsDir, 'app.asar.bak'),
     metaPath: path.join(backupsDir, 'app_asar_backup_meta.json'),
   };
+}
+
+function resolvePendingAsarPaths(paths) {
+  if (!paths?.pluginDataDir) return { jobPath: '', pidFile: '' };
+  return {
+    jobPath: path.join(paths.pluginDataDir, 'pending_asar_job.json'),
+    pidFile: path.join(paths.pluginDataDir, 'pending_asar_worker.pid'),
+  };
+}
+
+function resolveDetachedNodeRuntime() {
+  const curExec = process.execPath || 'node';
+  const baseName = path.basename(curExec).toLowerCase();
+  const isElectronHost = Boolean(process.versions?.electron) || !baseName.startsWith('node');
+  if (!isElectronHost) {
+    return { execPath: curExec, env: { ...process.env } };
+  }
+  if (process.platform === 'win32') {
+    const candidates = [
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
+      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
+      path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'nodejs', 'node.exe'),
+    ];
+    for (const c of candidates) {
+      try {
+        if (fs.existsSync(c)) {
+          const cleanEnv = { ...process.env };
+          delete cleanEnv.ELECTRON_RUN_AS_NODE;
+          delete cleanEnv.ELECTRON_NO_ASAR;
+          return { execPath: c, env: cleanEnv };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return {
+    execPath: curExec,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ELECTRON_NO_ASAR: '1' },
+  };
+}
+
+function samePathLoose(a, b) {
+  if (!a || !b) return false;
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
+}
+
+export function readPendingAsarApply(paths = {}, targetPath = '', targetStat = null) {
+  const { jobPath, pidFile } = resolvePendingAsarPaths(paths);
+  if (!jobPath) return null;
+  try {
+    if (!fs.existsSync(jobPath)) return null;
+    const job = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+    if (!job || typeof job !== 'object') return null;
+    if (targetPath && !samePathLoose(job.targetPath, targetPath)) return null;
+    if (!job.stagedPath || !fs.existsSync(job.stagedPath)) return null;
+    const ttlMs = Number(job.ttlMs) > 0 ? Number(job.ttlMs) : 24 * 60 * 60 * 1000;
+    if (Number(job.createdAtMs) > 0 && Date.now() - Number(job.createdAtMs) > ttlMs) return null;
+    if (targetStat && targetStat.isFile()) {
+      if (Number(job.expectedTargetSize) > 0 && targetStat.size !== Number(job.expectedTargetSize)) return null;
+      if (
+        Number(job.expectedTargetMtimeMs) > 0 &&
+        Math.abs(targetStat.mtimeMs - Number(job.expectedTargetMtimeMs)) > 2000
+      ) {
+        return null;
+      }
+    }
+    let workerPid = 0;
+    try {
+      if (pidFile && fs.existsSync(pidFile)) {
+        workerPid = Number(fs.readFileSync(pidFile, 'utf8').trim()) || 0;
+      }
+    } catch {
+      workerPid = 0;
+    }
+    return {
+      action: job.action || 'install',
+      appVersion: job.appVersion || '',
+      installedVersion: job.installedVersion || '',
+      stagedPath: job.stagedPath,
+      createdAtMs: Number(job.createdAtMs) || 0,
+      workerPid,
+      workerAlive: isPidAlive(workerPid),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingAsarApplySync(paths = {}, targetPath = '') {
+  const { jobPath } = resolvePendingAsarPaths(paths);
+  if (jobPath) {
+    try {
+      fs.rmSync(jobPath, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+  if (targetPath) {
+    try {
+      fs.rmSync(`${targetPath}.agy_pending`, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function scheduleDeferredAsarApplySync(
+  paths = {},
+  {
+    targetPath = '',
+    dataBuf = null,
+    action = 'install',
+    appVersion = '',
+    installedVersion = '',
+    watchPid = process.pid,
+  } = {},
+) {
+  const { jobPath, pidFile } = resolvePendingAsarPaths(paths);
+  if (!jobPath || !targetPath || !Buffer.isBuffer(dataBuf) || dataBuf.length === 0) {
+    return { ok: false, error: '延迟落盘参数不完整' };
+  }
+  const stagedPath = `${targetPath}.agy_pending`;
+  const tmpPath = `${targetPath}.agy_tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.mkdirSync(path.dirname(jobPath), { recursive: true });
+    fs.writeFileSync(tmpPath, dataBuf);
+    const tmpStat = fs.statSync(tmpPath);
+    if (tmpStat.size !== dataBuf.length) {
+      throw new Error(`暂存 ASAR 写入不完整 (${tmpStat.size}/${dataBuf.length})`);
+    }
+    try {
+      fs.rmSync(stagedPath, { force: true });
+    } catch {
+      // ignore
+    }
+    fs.renameSync(tmpPath, stagedPath);
+
+    let expectedTargetSize = 0;
+    let expectedTargetMtimeMs = 0;
+    try {
+      const targetStat = fs.statSync(targetPath);
+      expectedTargetSize = targetStat.size;
+      expectedTargetMtimeMs = targetStat.mtimeMs;
+    } catch {
+      // ignore
+    }
+
+    const pendingSha256 = crypto.createHash('sha256').update(dataBuf).digest('hex');
+    const jobObj = {
+      version: 1,
+      action,
+      targetPath,
+      stagedPath,
+      pidFile,
+      pendingSha256,
+      pendingSize: dataBuf.length,
+      expectedTargetSize,
+      expectedTargetMtimeMs,
+      appVersion,
+      installedVersion,
+      createdAtMs: Date.now(),
+      ttlMs: 24 * 60 * 60 * 1000,
+    };
+    const jobTmp = `${jobPath}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(jobTmp, JSON.stringify(jobObj, null, 2), 'utf8');
+    fs.renameSync(jobTmp, jobPath);
+
+    let workerPid = 0;
+    try {
+      if (fs.existsSync(pidFile)) {
+        const existingPid = Number(fs.readFileSync(pidFile, 'utf8').trim()) || 0;
+        if (isPidAlive(existingPid)) {
+          workerPid = existingPid;
+        }
+      }
+    } catch {
+      workerPid = 0;
+    }
+
+    const skipSpawn =
+      paths?.disableDeferredWorker === true || process.env.AGY_MONITOR_DISABLE_DEFERRED_WORKER === '1';
+    if (!workerPid && !skipSpawn && fs.existsSync(ASAR_APPLY_WORKER_PATH)) {
+      const runtime = resolveDetachedNodeRuntime();
+      const workerArgs = [ASAR_APPLY_WORKER_PATH, '--job', jobPath];
+      if (Number.isInteger(watchPid) && watchPid > 0) {
+        workerArgs.push('--watch-pid', String(watchPid));
+      }
+      const child = spawn(runtime.execPath, workerArgs, {
+        detached: true,
+        windowsHide: true,
+        stdio: 'ignore',
+        env: runtime.env,
+      });
+      if (child && child.pid) {
+        workerPid = child.pid;
+        try {
+          fs.writeFileSync(pidFile, String(workerPid), 'utf8');
+        } catch {
+          // ignore
+        }
+      }
+      if (child && typeof child.unref === 'function') {
+        child.unref();
+      }
+    }
+
+    return {
+      ok: true,
+      queued: true,
+      stagedPath,
+      jobPath,
+      workerPid,
+      workerAlive: workerPid > 0 ? isPidAlive(workerPid) : false,
+    };
+  } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    return {
+      ok: false,
+      error: err?.message || String(err),
+    };
+  }
 }
 
 async function ensureCleanBackupForCurrentVersion(paths, curAsarBuf, appVersion) {
@@ -4020,6 +4369,7 @@ export async function inspectNativeHudState(paths = {}) {
   }
 
   const cached = asarInspectCache.get(asarPath);
+  const pendingApply = readPendingAsarApply(paths, asarPath, stat);
   if (
     cached &&
     cached.mtimeMs === stat.mtimeMs &&
@@ -4038,6 +4388,7 @@ export async function inspectNativeHudState(paths = {}) {
       currentVersion: NATIVE_HUD_VERSION,
       devToolsPort,
       heartbeat,
+      pendingApply,
       error: '',
     };
   }
@@ -4070,6 +4421,7 @@ export async function inspectNativeHudState(paths = {}) {
       currentVersion: NATIVE_HUD_VERSION,
       devToolsPort,
       heartbeat,
+      pendingApply,
       error: '',
     };
   } catch (err) {
@@ -4086,6 +4438,7 @@ export async function inspectNativeHudState(paths = {}) {
       currentVersion: NATIVE_HUD_VERSION,
       devToolsPort,
       heartbeat,
+      pendingApply,
       error: err?.message || '解析 app.asar 失败',
     };
   }
@@ -4101,11 +4454,28 @@ export async function installNativeHud(paths = {}, { force = false, liteMode, th
     return { ok: false, diskWritten: false, pendingRestart: false, error: '未找到 Antigravity 的 resources/app.asar', status: before };
   }
   if (!force && before.state === 'installed') {
+    clearPendingAsarApplySync(paths, before.asarPath);
     return {
       ok: true,
       alreadyUpToDate: true,
       diskWritten: true,
       pendingRestart: !before.heartbeat.alive,
+      status: before,
+    };
+  }
+  if (
+    !force &&
+    before.pendingApply?.action === 'install' &&
+    before.pendingApply.workerAlive &&
+    before.pendingApply.appVersion === before.appVersion &&
+    before.pendingApply.installedVersion === NATIVE_HUD_VERSION
+  ) {
+    return {
+      ok: true,
+      alreadyQueued: true,
+      queuedForExit: true,
+      diskWritten: false,
+      pendingRestart: true,
       status: before,
     };
   }
@@ -4152,9 +4522,31 @@ export async function installNativeHud(paths = {}, { force = false, liteMode, th
     const newAsarBuf = repackAsarInMemory(cleanStockBuf, overrides, new Set());
     const writeRes = await writeAsarSafely(before.asarPath, newAsarBuf);
     asarInspectCache.delete(before.asarPath);
-    const after = await inspectNativeHudState(paths);
 
     if (!writeRes.ok) {
+      if (writeRes.locked && paths?.pluginDataDir) {
+        const deferRes = scheduleDeferredAsarApplySync(paths, {
+          targetPath: before.asarPath,
+          dataBuf: newAsarBuf,
+          action: 'install',
+          appVersion,
+          installedVersion: NATIVE_HUD_VERSION,
+        });
+        const afterQueued = await inspectNativeHudState(paths);
+        if (deferRes.ok) {
+          return {
+            ok: true,
+            diskWritten: false,
+            queuedForExit: true,
+            pendingRestart: true,
+            backupPath: bakPath,
+            lockError: writeRes.error,
+            message: '已为新版 Antigravity 备好补丁，关闭并重启 Antigravity 后将自动落盘生效',
+            status: afterQueued,
+          };
+        }
+      }
+      const after = await inspectNativeHudState(paths);
       return {
         ok: false,
         diskWritten: false,
@@ -4166,6 +4558,8 @@ export async function installNativeHud(paths = {}, { force = false, liteMode, th
       };
     }
 
+    clearPendingAsarApplySync(paths, before.asarPath);
+    const after = await inspectNativeHudState(paths);
     return {
       ok: true,
       alreadyUpToDate: false,
@@ -4209,7 +4603,8 @@ export async function restoreStockAsar(paths = {}) {
     const { cleanStockBuf } = await ensureCleanBackupForCurrentVersion(paths, curRaw, appVersion);
 
     if (before.state === 'stock') {
-      await fsp.rm(`${before.asarPath}.agy_stale`, { force: true }).catch(() => {});
+      clearPendingAsarApplySync(paths, before.asarPath);
+      await cleanupStaleAsarSiblings(before.asarPath);
       return {
         ok: true,
         alreadyStock: true,
@@ -4221,8 +4616,27 @@ export async function restoreStockAsar(paths = {}) {
 
     const writeRes = await writeAsarSafely(before.asarPath, cleanStockBuf);
     asarInspectCache.delete(before.asarPath);
-    const after = await inspectNativeHudState(paths);
     if (!writeRes.ok) {
+      if (writeRes.locked && paths?.pluginDataDir) {
+        const deferRes = scheduleDeferredAsarApplySync(paths, {
+          targetPath: before.asarPath,
+          dataBuf: cleanStockBuf,
+          action: 'restore',
+          appVersion,
+        });
+        const afterQueued = await inspectNativeHudState(paths);
+        if (deferRes.ok) {
+          return {
+            ok: true,
+            diskWritten: false,
+            queuedForExit: true,
+            pendingRestart: true,
+            message: '已备好原版 app.asar，关闭 Antigravity 后将自动完成还原',
+            status: afterQueued,
+          };
+        }
+      }
+      const after = await inspectNativeHudState(paths);
       return {
         ok: false,
         diskWritten: false,
@@ -4231,6 +4645,8 @@ export async function restoreStockAsar(paths = {}) {
         status: after,
       };
     }
+    clearPendingAsarApplySync(paths, before.asarPath);
+    const after = await inspectNativeHudState(paths);
     return {
       ok: true,
       diskWritten: true,
@@ -4290,11 +4706,7 @@ export function restoreStockAsarSync(paths = {}) {
         lookupAsarNode(curParsed.root, ASAR_META_REL),
     );
     if (!hasHookInEntry && !hasOurArtifacts) {
-      try {
-        fs.rmSync(`${asarPath}.agy_stale`, { force: true });
-      } catch {
-        // ignore
-      }
+      cleanupStaleAsarSiblingsSync(asarPath);
       return { ok: true, asarPath, alreadyStock: true, diskWritten: false, pendingRestart: false };
     }
 

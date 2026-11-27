@@ -32,6 +32,10 @@ import {
   buildCdpThemeCss,
   isAntigravityAppTarget,
 } from '../sidecars/agy_monitor/backend/cdp_theme_bridge.mjs';
+import {
+  applyPendingAsarJobOnce,
+  runPendingAsarWorker,
+} from '../sidecars/agy_monitor/backend/asar_apply_worker.mjs';
 import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 import { createMonitorHandlers } from '../sidecars/agy_monitor/main.mjs';
@@ -977,10 +981,11 @@ test('hud_injector: main hook goes dormant immediately when plugin.json is absen
   }
 });
 
-test('hud_injector: defers live outdated app.asar rewrite, never creates .agy_stale on lock, and restores synchronously', async () => {
+test('hud_injector: defers live outdated app.asar rewrite, uses zero-truncation atomic inode swap on EPERM, rolls back on failure, and restores synchronously', async () => {
   clearHudInjectorCaches();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-safe-write-'));
-  const origOpen = fsp.open;
+  const origRename = fsp.rename;
+  const origWriteFile = fsp.writeFile;
   try {
     const asarPath = path.join(tmpDir, 'app.asar');
     const stockAsar = buildSyntheticAsar({
@@ -1019,34 +1024,59 @@ test('hud_injector: defers live outdated app.asar rewrite, never creates .agy_st
     assert.equal(deferred.deferredWhileRunning, true);
     assert.equal(deferred.pendingRestart, true);
     assert.equal((await inspectNativeHudState(paths)).installedVersion, '2.1.0');
-    assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
 
-    // 2. writeAsarSafely fails cleanly on EBUSY lock without creating .agy_stale or corrupting target
-    fsp.open = async (p, flags) => {
-      if (p === asarPath && flags === 'r+') {
-        const err = new Error('EBUSY: resource busy or locked');
+    // 2. When direct rename(tmp -> app.asar) fails with EPERM (Windows open Electron handle),
+    //    writeAsarSafely NEVER writes in-place to app.asar and succeeds via zero-truncation atomic_inode_swap
+    const directWritesToTarget = [];
+    let firstReplaceSimulated = false;
+    fsp.writeFile = async (p, data, ...rest) => {
+      if (p === asarPath) directWritesToTarget.push(p);
+      return origWriteFile.call(fsp, p, data, ...rest);
+    };
+    fsp.rename = async (src, dst) => {
+      if (!firstReplaceSimulated && src.includes('.agy_tmp.') && dst === asarPath) {
+        firstReplaceSimulated = true;
+        const err = new Error('EPERM: operation not permitted, rename');
+        err.code = 'EPERM';
+        throw err;
+      }
+      return origRename.call(fsp, src, dst);
+    };
+    const swappedRes = await writeAsarSafely(asarPath, stockAsar);
+    fsp.rename = origRename;
+    fsp.writeFile = origWriteFile;
+    assert.equal(swappedRes.ok, true);
+    assert.equal(swappedRes.method, 'atomic_inode_swap');
+    assert.equal(directWritesToTarget.length, 0, 'must NEVER overwrite live app.asar in-place');
+    assert.equal(fs.readFileSync(asarPath).equals(stockAsar), true);
+
+    // 3. When second rename fails mid-swap, writeAsarSafely rolls back original app.asar atomically
+    fsp.rename = async (src, dst) => {
+      if (src.includes('.agy_tmp.') && dst === asarPath) {
+        const err = new Error('EBUSY: resource busy');
         err.code = 'EBUSY';
         throw err;
       }
-      return origOpen.call(fsp, p, flags);
+      return origRename.call(fsp, src, dst);
     };
-    const lockedRes = await writeAsarSafely(asarPath, stockAsar);
-    fsp.open = origOpen;
-    assert.equal(lockedRes.ok, false);
-    assert.equal(lockedRes.locked, true);
-    assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
-    assert.equal(fs.readFileSync(asarPath).equals(outdatedAsar), true);
+    const rolledBack = await writeAsarSafely(asarPath, outdatedAsar);
+    fsp.rename = origRename;
+    assert.equal(rolledBack.ok, false);
+    assert.equal(rolledBack.locked, true);
+    assert.equal(fs.readFileSync(asarPath).equals(stockAsar), true, 'rollback must preserve original app.asar intact');
 
-    // 3. Explicit force install upgrades atomically when unlocked and cleans any stale leftover
+    // 4. Explicit force install upgrades atomically when unlocked and cleans any stale leftover
     fs.writeFileSync(`${asarPath}.agy_stale`, Buffer.from('legacy stale'));
+    fs.writeFileSync(`${asarPath}.agy_stale.9999.1`, Buffer.from('legacy timestamped stale'));
     const forced = await installNativeHud(paths, { force: true });
     assert.equal(forced.ok, true);
     assert.equal(forced.diskWritten, true);
     assert.equal(forced.writeMethod, 'atomic_replace');
     assert.equal(forced.status.state, 'installed');
     assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
+    assert.equal(fs.existsSync(`${asarPath}.agy_stale.9999.1`), false);
 
-    // 4. Synchronous stock restore brings app.asar cleanly back to stock
+    // 5. Synchronous stock restore brings app.asar cleanly back to stock
     const syncRestored = restoreStockAsarSync(paths);
     assert.equal(syncRestored.ok, true);
     assert.equal(syncRestored.diskWritten, true);
@@ -1054,7 +1084,102 @@ test('hud_injector: defers live outdated app.asar rewrite, never creates .agy_st
     assert.equal(afterSync.state, 'stock');
     assert.equal(afterSync.appVersion, '2.38.0');
   } finally {
-    fsp.open = origOpen;
+    fsp.rename = origRename;
+    fsp.writeFile = origWriteFile;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('hud_injector: queues deferred exit-apply when app.asar rename is EBUSY and worker atomically swaps on unlock', async () => {
+  clearHudInjectorCaches();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-deferred-'));
+  const origRename = fsp.rename;
+  try {
+    const asarPath = path.join(tmpDir, 'app.asar');
+    const stockAsar = buildSyntheticAsar({
+      'package.json': JSON.stringify({ name: 'antigravity', version: '2.36.0', main: 'dist/main.js' }),
+      'dist/main.js': '"use strict";\nconsole.log("stock main 2.36.0");\n',
+    });
+    fs.writeFileSync(asarPath, stockAsar);
+
+    const paths = resolvePaths({
+      appDataDir: path.join(tmpDir, 'appdata'),
+      geminiConfigDir: path.join(tmpDir, 'config'),
+      hostAsarPath: asarPath,
+      devToolsActivePortFile: path.join(tmpDir, 'missing_dt'),
+    });
+    paths.disableDeferredWorker = true;
+
+    // 1. Simulate Windows EBUSY lock on both direct replace & inode swap -> installNativeHud queues pending job
+    fsp.rename = async (src, dst) => {
+      if (src === asarPath || dst === asarPath) {
+        const err = new Error('EBUSY: resource busy or locked, rename');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return origRename.call(fsp, src, dst);
+    };
+    const queued = await installNativeHud(paths);
+    fsp.rename = origRename;
+    assert.equal(queued.ok, true);
+    assert.equal(queued.diskWritten, false);
+    assert.equal(queued.queuedForExit, true);
+    assert.equal(queued.pendingRestart, true);
+    assert.equal(queued.status.pendingApply?.action, 'install');
+    assert.equal(queued.status.pendingApply?.appVersion, '2.36.0');
+    assert.equal(fs.existsSync(`${asarPath}.agy_pending`), true);
+    const jobPath = path.join(paths.pluginDataDir, 'pending_asar_job.json');
+    assert.equal(fs.existsSync(jobPath), true);
+
+    // 2. Worker sees EBUSY twice while Antigravity is closing, then atomically renames on 3rd attempt
+    let lockTicks = 2;
+    const mockFs = Object.create(fs);
+    mockFs.renameSync = (src, dst) => {
+      if (lockTicks > 0) {
+        lockTicks -= 1;
+        const err = new Error('EBUSY: still closing');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return fs.renameSync(src, dst);
+    };
+    const workerRes = await runPendingAsarWorker(jobPath, {
+      watchPid: 0,
+      pollMs: 25,
+      maxWaitMs: 3000,
+      fsMod: mockFs,
+    });
+    assert.equal(workerRes.status, 'applied');
+    assert.equal(fs.existsSync(jobPath), false);
+    assert.equal(fs.existsSync(`${asarPath}.agy_pending`), false);
+    const finalState = await inspectNativeHudState(paths);
+    assert.equal(finalState.state, 'installed');
+    assert.equal(finalState.appVersion, '2.36.0');
+
+    // 3. Target-changed guard: if app.asar changes to a newer version before apply, worker aborts safely
+    fs.writeFileSync(asarPath, stockAsar);
+    fsp.rename = async (src, dst) => {
+      if (src === asarPath || dst === asarPath) {
+        const err = new Error('EBUSY');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return origRename.call(fsp, src, dst);
+    };
+    await installNativeHud(paths, { force: true });
+    fsp.rename = origRename;
+    const newerStock = buildSyntheticAsar({
+      'package.json': JSON.stringify({ name: 'antigravity', version: '2.37.0', main: 'dist/main.js' }),
+      'dist/main.js': '"use strict";\nconsole.log("brand new 2.37.0 release");\n',
+    });
+    fs.writeFileSync(asarPath, newerStock);
+    const guardRes = applyPendingAsarJobOnce(jobPath);
+    assert.equal(guardRes.status, 'target_changed');
+    assert.equal(fs.readFileSync(asarPath).equals(newerStock), true, 'must NEVER overwrite a newer app.asar');
+    assert.equal(fs.existsSync(jobPath), false);
+    assert.equal(fs.existsSync(`${asarPath}.agy_pending`), false);
+  } finally {
+    fsp.rename = origRename;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
