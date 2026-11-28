@@ -222,3 +222,47 @@ test('AgyBackdrop.cs & backdrop_manager.mjs Issue #7 RAM/VRAM optimizations and 
   const invalidPidArgs = buildBackdropSpawnArgs(rtSample, { isWsl: false, parentPid: 0 });
   assert.equal(invalidPidArgs.includes('--parent-pid'), false);
 });
+
+test('AgyBackdrop.cs scopes WinEvent hooks to host PIDs, attaches drag-only location hook, persists tray HUD toggle, and idles UIA worker', () => {
+  const src = fs.readFileSync(BACKDROP_CS, 'utf8');
+
+  // 1. Global hook limited to EVENT_SYSTEM_FOREGROUND with WINEVENT_SKIPOWNPROCESS
+  const installStart = src.indexOf('private void InstallHooks()');
+  const syncHooksStart = src.indexOf('private void SyncHostPidHooks()');
+  assert.ok(installStart > 0 && syncHooksStart > installStart);
+  const installBlock = src.slice(installStart, syncHooksStart);
+  assert.match(installBlock, /WINEVENT_SKIPOWNPROCESS/);
+  assert.match(installBlock, /EVENT_SYSTEM_FOREGROUND/);
+  assert.doesNotMatch(installBlock, /EVENT_OBJECT_/);
+
+  // 2. Permanent per-host-PID hooks exclude noisy EVENT_OBJECT_* streams
+  const onWinStart = src.indexOf('private void OnWinEvent(');
+  assert.ok(onWinStart > syncHooksStart);
+  const syncHooksBlock = src.slice(syncHooksStart, onWinStart);
+  assert.match(syncHooksBlock, /EVENT_SYSTEM_MOVESIZESTART/);
+  assert.match(syncHooksBlock, /EVENT_SYSTEM_MINIMIZESTART/);
+  assert.doesNotMatch(syncHooksBlock, /EVENT_OBJECT_LOCATIONCHANGE/);
+  assert.doesNotMatch(syncHooksBlock, /EVENT_OBJECT_REORDER/);
+  assert.doesNotMatch(syncHooksBlock, /EVENT_OBJECT_SHOW/);
+  assert.doesNotMatch(syncHooksBlock, /EVENT_OBJECT_HIDE/);
+
+  // 3. Drag-only EVENT_OBJECT_LOCATIONCHANGE hook attached on StartRenderFollow and detached on StopRenderFollow & Dispose
+  assert.match(src, /private\s+void\s+AttachDragLocationHook\s*\(/);
+  assert.match(src, /private\s+void\s+DetachDragLocationHook\s*\(/);
+  const startFollowStart = src.indexOf('private void StartRenderFollow(');
+  const stopFollowStart = src.indexOf('private void StopRenderFollow(');
+  const onRenderStart = src.indexOf('private void OnCompositionRendering(');
+  assert.ok(startFollowStart > 0 && stopFollowStart > startFollowStart && onRenderStart > stopFollowStart);
+  assert.match(src.slice(startFollowStart, stopFollowStart), /AttachDragLocationHook\s*\(/);
+  assert.match(src.slice(stopFollowStart, onRenderStart), /DetachDragLocationHook\s*\(/);
+
+  // 4. Adaptive FastStateWatchTick + fast QueryFullProcessImageName lookup + tray HUD persistence + UIA idle gate
+  assert.match(src, /private\s+void\s+FastStateWatchTick\s*\(/);
+  assert.match(src, /GetWindow\(item\.Hwnd,\s*Native\.GW_HWNDNEXT\)/);
+  assert.match(src, /GetProcessBaseNameFast\s*\(/);
+  assert.match(src, /QueryFullProcessImageName\s*\(/);
+  assert.match(src, /private\s+void\s+PersistHudEnabledToThemesFile\s*\(/);
+  assert.match(src, /_hudEnabledByTray\s*=\s*next\.hudEnabled;/);
+  assert.match(src, /bool\s+hudWantActive\s*=/);
+  assert.match(src, /if\s*\(\s*!hudWantActive\s*\)\s*waitMs\s*=\s*2000;/);
+});

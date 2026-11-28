@@ -1566,7 +1566,7 @@ async function runWorkerMain() {
       : resolveDefaultCacheDbPath();
   const rawInterval =
     wData?.scanIntervalMs !== undefined ? wData.scanIntervalMs : process.env.AGY_MONITOR_SCAN_INTERVAL_MS;
-  const intervalMs = rawInterval === undefined ? 1500 : Number(rawInterval);
+  const intervalMs = rawInterval === undefined ? 4000 : Number(rawInterval);
 
   const sendToParent = (payload) => {
     try {

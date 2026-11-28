@@ -2383,10 +2383,10 @@ export function createThemeStudio({
     backdropPollTicks += 1;
     const themePanel = document.getElementById("panelTheme");
     const onThemeTab = Boolean(themePanel && !themePanel.hidden);
-    if (onThemeTab || backdropPollTicks % 2 === 0) {
+    if (onThemeTab || backdropPollTicks % 5 === 0) {
       void refreshBackdropStatus();
     }
-  }, 1500);
+  }, 3000);
   if (typeof backdropPollTimer?.unref === "function") {
     backdropPollTimer.unref();
   }
