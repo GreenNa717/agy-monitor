@@ -13,6 +13,14 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.2.4",
+    date: "2026-11-28",
+    title: "修复 /compact 上下文压缩误触发掌握汇报钩子（PR #9）",
+    items: [
+      "合入 PR #9（@Elosiad）：在 PreInvocation 定时总结钩子（mastery_summary_hook.mjs）中精准识别并跳过 /compact 上下文压缩命令（兼容大小写、前后空白与附加指令），避免向压缩请求注入「AGY掌握·开场汇报」污染总结内容，也不再改写当前会话的 hook_state 状态；普通对话中提及 /compact 仍正常处理。",
+    ],
+  },
+  {
     version: "1.2.3",
     date: "2026-11-28",
     title: "修复 Antigravity 升级后美化失效死锁（新增独立退出原子落盘进程）",
