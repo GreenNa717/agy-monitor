@@ -180,6 +180,68 @@ test('PreInvocation mastery_summary_hook respects default-off, PLUGIN_DATA fallb
   }
 });
 
+test('PreInvocation mastery_summary_hook skips /compact context-compaction invocations', async (t) => {
+  const { paths, storage } = makeTempEnv(t);
+  await storage.updateMasteryConfig({ enabled: true, source: 'self', frequency: '30s' });
+
+  const statePath = (convId) => path.join(paths.pluginDataDir, 'hook_state', `${convId}.json`);
+
+  // 1. /compact must not inject the opening report, and must not create hook state
+  const outCompact = evaluateMasteryHook(
+    { conversationId: 'conv-compact', invocationNum: 0, lastUserInput: '/compact' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_000 },
+  );
+  assert.deepEqual(outCompact, {});
+  assert.equal(fs.existsSync(statePath('conv-compact')), false, 'compaction must not write hook state');
+
+  // 2. Trailing instructions, surrounding whitespace and any casing are still the compaction command
+  for (const [i, input] of ['  /compact 保留 API 设计  ', '/COMPACT', '/compact\n'].entries()) {
+    const out = evaluateMasteryHook(
+      { conversationId: 'conv-compact', invocationNum: 0, lastUserInput: input },
+      { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_100 + i },
+    );
+    assert.deepEqual(out, {}, `expected ${JSON.stringify(input)} to be treated as compaction`);
+  }
+  assert.equal(fs.existsSync(statePath('conv-compact')), false, 'compaction must not write hook state');
+
+  // 3. A normal message that merely mentions /compact is still a user task
+  const outMention = evaluateMasteryHook(
+    { conversationId: 'conv-compact', invocationNum: 1, lastUserInput: '解释一下 /compact 有什么用' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_300 },
+  );
+  assert.equal(outMention.injectSteps?.length, 1);
+  assert.match(outMention.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS\|10%/);
+
+  // 4. Compacting an ongoing task must not rewrite the conversation state
+  const conv2 = 'conv-compact-after-task';
+  const first = evaluateMasteryHook(
+    { conversationId: conv2, invocationNum: 0, lastUserInput: '修复登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_400 },
+  );
+  assert.equal(first.injectSteps?.length, 1);
+  const beforeState = fs.readFileSync(statePath(conv2), 'utf8');
+  const outMidTask = evaluateMasteryHook(
+    { conversationId: conv2, invocationNum: 1, lastUserInput: '/compact' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_500 },
+  );
+  assert.deepEqual(outMidTask, {});
+  assert.equal(fs.readFileSync(statePath(conv2), 'utf8'), beforeState, 'compaction must not rewrite state');
+
+  // 5. After a compaction the next real user input still gets the opening report
+  const conv3 = 'conv-compact-then-task';
+  const outCompactFresh = evaluateMasteryHook(
+    { conversationId: conv3, invocationNum: 0, lastUserInput: '/compact' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_600 },
+  );
+  assert.deepEqual(outCompactFresh, {});
+  const afterCompact = evaluateMasteryHook(
+    { conversationId: conv3, invocationNum: 1, lastUserInput: '继续修复登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 3_000_700 },
+  );
+  assert.equal(afterCompact.injectSteps?.length, 1);
+  assert.match(afterCompact.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS\|10%/);
+});
+
 test('parseProgressTag, classifyToolCall, and buildMasterySnapshot align total progress with Main Agent & classify Codex actions', async (t) => {
   const { paths } = makeTempEnv(t);
 

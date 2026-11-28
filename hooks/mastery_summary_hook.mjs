@@ -3,6 +3,8 @@
  *
  * - Default OFF: when mastery_config.json is missing, disabled, or using thirdparty mode,
  *   returns `{}` immediately (<10ms, zero injection, zero token overhead).
+ * - `/compact` (on-demand context compaction) is skipped entirely: it is a host maintenance
+ *   invocation, not a user task, so it must not receive the progress prompt nor overwrite state.
  * - When enabled with `source === "self"`:
  *   1) At the start of a new user task (first invocation for a given lastUserInput), appends
  *      a concise tail systemMessage instructing the running Agent to emit a ~30-char kid-friendly
@@ -183,6 +185,18 @@ function hashText(raw) {
   return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12);
 }
 
+/**
+ * `/compact` (optionally followed by instructions) is the host's on-demand context
+ * compaction command. It triggers an extra model invocation whose only job is to
+ * summarize the conversation, so it is not a new user task and must never receive
+ * the mastery progress prompt.
+ */
+const COMPACTION_COMMAND_RE = /^\/compact(?:\s|$)/i;
+
+function isCompactionInvocation(rawUserInput) {
+  return typeof rawUserInput === 'string' && COMPACTION_COMMAND_RE.test(rawUserInput.trim());
+}
+
 export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now() } = {}) {
   const candidateDirs = resolvePluginDataDirs(pluginDataDir);
   const { rawCfg, activeDataDir } = readLatestMasteryConfig(candidateDirs);
@@ -191,6 +205,15 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
     typeof payload?.conversationId === 'string' && payload.conversationId.trim()
       ? payload.conversationId.trim()
       : 'default';
+
+  const lastUserInput = typeof payload?.lastUserInput === 'string' ? payload.lastUserInput : '';
+
+  // Context compaction is a host maintenance invocation, not a user task: injecting the
+  // opening/periodic progress instruction here would be folded into the compaction prompt,
+  // pollute the generated summary and waste tokens. Skip it without touching conversation state.
+  if (isCompactionInvocation(lastUserInput)) {
+    return {};
+  }
 
   const cfg =
     rawCfg && typeof rawCfg === 'object'
@@ -225,7 +248,7 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
 
   const freqMs = FREQ_MS[cfg.frequency] || FREQ_MS['1m'];
   const invocationNum = Number(payload?.invocationNum || 0);
-  const inputHash = hashText(payload?.lastUserInput || '');
+  const inputHash = hashText(lastUserInput);
   const prev = existingPrev || {};
 
   const isNewUserTask =
