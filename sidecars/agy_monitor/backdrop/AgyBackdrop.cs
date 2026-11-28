@@ -155,6 +155,8 @@ namespace AgyBackdropCompanion
         public const uint EVENT_OBJECT_SELECTION = 0x8006;
         public const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+        public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
         public const uint RDW_INVALIDATE = 0x0001;
         public const uint RDW_FRAME = 0x0400;
@@ -678,6 +680,31 @@ namespace AgyBackdropCompanion
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr hObject);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+
+        public static string GetProcessBaseNameFast(uint pid)
+        {
+            if (pid == 0) return "";
+            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero) return "";
+            try
+            {
+                var sb = new StringBuilder(512);
+                int len = sb.Capacity;
+                if (QueryFullProcessImageName(hProc, 0, sb, ref len) && len > 0)
+                {
+                    return System.IO.Path.GetFileNameWithoutExtension(sb.ToString(0, len));
+                }
+            }
+            catch { }
+            finally
+            {
+                CloseHandle(hProc);
+            }
+            return "";
+        }
+
         public static string GetWindowTitleText(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return "";
@@ -974,7 +1001,7 @@ namespace AgyBackdropCompanion
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.HighQuality);
+            RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.Linear);
 
             _dimRect = new System.Windows.Shapes.Rectangle
             {
@@ -1047,7 +1074,7 @@ namespace AgyBackdropCompanion
             // keep Effect = null on the live full-screen Image so WPF never allocates D3D9 blur render targets.
             RenderOptions.SetBitmapScalingMode(
                 _image,
-                _interactiveResizing ? BitmapScalingMode.LowQuality : BitmapScalingMode.HighQuality);
+                _interactiveResizing ? BitmapScalingMode.LowQuality : BitmapScalingMode.Linear);
             if (_image.Effect != null)
             {
                 _image.Effect = null;
@@ -4761,11 +4788,14 @@ namespace AgyBackdropCompanion
         private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
         private readonly Dictionary<IntPtr, TrackedHostWindow> _tracked = new Dictionary<IntPtr, TrackedHostWindow>();
         private readonly List<IntPtr> _hooks = new List<IntPtr>();
+        private readonly Dictionary<uint, List<IntPtr>> _hostPidHooks = new Dictionary<uint, List<IntPtr>>();
+        private IntPtr _dragLocationHook = IntPtr.Zero;
         private Native.WinEventDelegate _winEventDelegate;
 
         private FileSystemWatcher _watcher;
         private DispatcherTimer _debounceTimer;
         private DispatcherTimer _reconcileTimer;
+        private DispatcherTimer _fastStateTimer;
         private Thread _stopListenerThread;
         private Thread _trimListenerThread;
         private Thread _uiaWorkerThread;
@@ -4969,7 +4999,7 @@ namespace AgyBackdropCompanion
             int reconcileTick = 0;
             bool startupTrimmed = false;
             _reconcileTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher);
-            _reconcileTimer.Interval = TimeSpan.FromMilliseconds(1000);
+            _reconcileTimer.Interval = TimeSpan.FromMilliseconds(2500);
             _reconcileTimer.Tick += delegate
             {
                 if (_disposed) return;
@@ -4977,21 +5007,29 @@ namespace AgyBackdropCompanion
                 if (!CheckHostLiveness()) return;
                 CheckDataFilesTimestamp();
                 SyncAllWindows((reconcileTick % 2) == 0);
-                if (!startupTrimmed && reconcileTick >= 4)
+                if (!startupTrimmed && reconcileTick >= 2)
                 {
                     startupTrimmed = true;
                     Native.TrimWorkingSet();
                 }
-                else if ((reconcileTick % 300) == 0)
+                else if ((reconcileTick % 120) == 0)
                 {
                     Native.TrimWorkingSet();
                 }
-                if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 3.0)
+                if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 15.0)
                 {
                     WriteStatusFile(true);
                 }
             };
             _reconcileTimer.Start();
+
+            _fastStateTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher);
+            _fastStateTimer.Interval = TimeSpan.FromMilliseconds(150);
+            _fastStateTimer.Tick += delegate
+            {
+                FastStateWatchTick();
+            };
+            _fastStateTimer.Start();
 
             SyncAllWindows(true);
             WriteStatusFile(true);
@@ -5041,8 +5079,11 @@ namespace AgyBackdropCompanion
             {
                 _dispatcher.BeginInvoke(new Action(delegate
                 {
-                    _hudEnabledByTray = !_hudEnabledByTray;
-                    _hudMenuItem.Checked = _hudEnabledByTray;
+                    bool nextHud = !(_config.hudEnabled && _hudEnabledByTray);
+                    _config.hudEnabled = nextHud;
+                    _hudEnabledByTray = nextHud;
+                    _hudMenuItem.Checked = nextHud;
+                    PersistHudEnabledToThemesFile(nextHud);
                     SyncAllWindows(false);
                     WriteStatusFile(true);
                 }));
@@ -5130,6 +5171,34 @@ namespace AgyBackdropCompanion
             catch { }
         }
 
+        private void DetachDragLocationHook()
+        {
+            if (_dragLocationHook != IntPtr.Zero)
+            {
+                try { Native.UnhookWinEvent(_dragLocationHook); } catch { }
+                _dragLocationHook = IntPtr.Zero;
+            }
+        }
+
+        private void AttachDragLocationHook(IntPtr hwnd)
+        {
+            DetachDragLocationHook();
+            if (_disposed || _winEventDelegate == null || hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return;
+            uint pid = 0;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0 || pid == (uint)_selfPid) return;
+            uint flags = Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS;
+            _dragLocationHook = Native.SetWinEventHook(
+                Native.EVENT_OBJECT_LOCATIONCHANGE,
+                Native.EVENT_OBJECT_LOCATIONCHANGE,
+                IntPtr.Zero,
+                _winEventDelegate,
+                pid,
+                0,
+                flags
+            );
+        }
+
         private void StartRenderFollow(IntPtr hwnd)
         {
             _moveSizingHwnd = hwnd;
@@ -5139,6 +5208,7 @@ namespace AgyBackdropCompanion
             {
                 Native.TryGetVisibleBounds(hwnd, out _renderFollowLastRect);
             }
+            AttachDragLocationHook(hwnd);
             if (!_renderFollowAttached && !_disposed)
             {
                 _renderFollowAttached = true;
@@ -5148,6 +5218,7 @@ namespace AgyBackdropCompanion
 
         private void StopRenderFollow()
         {
+            DetachDragLocationHook();
             if (_renderFollowAttached)
             {
                 _renderFollowAttached = false;
@@ -5213,6 +5284,93 @@ namespace AgyBackdropCompanion
             {
                 StopRenderFollow();
                 if (!_inSync) SyncAllWindows(false);
+            }
+        }
+
+        private void SetFastStateIntervalMs(int ms)
+        {
+            if (_fastStateTimer == null) return;
+            if (Math.Abs(_fastStateTimer.Interval.TotalMilliseconds - ms) > 1.0)
+            {
+                _fastStateTimer.Interval = TimeSpan.FromMilliseconds(ms);
+            }
+        }
+
+        private void FastStateWatchTick()
+        {
+            if (_disposed || _inSync || _tracked.Count == 0)
+            {
+                SetFastStateIntervalMs(800);
+                return;
+            }
+            if (_renderFollowAttached)
+            {
+                SetFastStateIntervalMs(400);
+                return;
+            }
+
+            IntPtr fg = Native.GetForegroundWindow();
+            bool fgTracked = fg != IntPtr.Zero && _tracked.ContainsKey(fg);
+            SetFastStateIntervalMs(fgTracked ? 150 : 800);
+
+            bool wantBackdrop = IsBackdropEffectWanted();
+            foreach (TrackedHostWindow item in _tracked.Values)
+            {
+                if (!Native.IsWindow(item.Hwnd))
+                {
+                    SyncAllWindows(true);
+                    return;
+                }
+
+                bool hostVis = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
+                if (!hostVis)
+                {
+                    if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
+                    {
+                        Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
+                        item.BackdropVisible = false;
+                        _backdropHideCount++;
+                        _backdropLastHideReason = "fast-watch-hidden";
+                    }
+                    HideHudIfVisible(item);
+                    continue;
+                }
+
+                if (wantBackdrop && !item.BackdropVisible && !item.BackdropGuardBlocked)
+                {
+                    SyncAllWindows(false);
+                    return;
+                }
+
+                if (!wantBackdrop || !item.BackdropVisible || item.Backdrop == null || item.Backdrop.Handle == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                Native.RECT r;
+                if (Native.TryGetVisibleBounds(item.Hwnd, out r))
+                {
+                    int w = Math.Max(1, r.Right - r.Left);
+                    int h = Math.Max(1, r.Bottom - r.Top);
+                    bool isMax = Native.IsZoomed(item.Hwnd);
+                    if (r.Left != item.LastLeft || r.Top != item.LastTop || w != item.LastWidth || h != item.LastHeight || isMax != item.LastMaximized)
+                    {
+                        SyncAllWindows(false);
+                        StartRenderFollow(item.Hwnd);
+                        return;
+                    }
+
+                    IntPtr nextHwnd = Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT);
+                    if (nextHwnd != item.Backdrop.Handle)
+                    {
+                        string blk;
+                        if (!Native.IsDirectlyBehindVisible(item.Backdrop.Handle, item.Hwnd, r, out blk))
+                        {
+                            SyncAllWindows(false);
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -5334,6 +5492,8 @@ namespace AgyBackdropCompanion
                     bool userActiveNow = false;
                     bool isFgTracked = false;
                     bool anyOccluded = false;
+                    bool useZeroUia = true;
+                    bool hudWantActive = false;
                     try
                     {
                         var snapHwnds = new List<IntPtr>();
@@ -5349,7 +5509,6 @@ namespace AgyBackdropCompanion
                         var snapHudHwnd = new List<IntPtr>();
                         var snapBackdropHwnd = new List<IntPtr>();
                         bool cdpTakesHud = false;
-                        bool useZeroUia = true;
                         bool snapConsoleVis = false;
                         int snapConsolePhysW = 0;
 
@@ -5358,6 +5517,7 @@ namespace AgyBackdropCompanion
                         {
                             cdpTakesHud = _hudTelemetry != null && _hudTelemetry.cdpHudActive;
                             useZeroUia = _config != null && _config.zeroUiaMode;
+                            hudWantActive = _config != null && _config.hudEnabled && _hudEnabledByTray && !_pausedByTray && !cdpTakesHud;
                             long vpNowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
                             bool vpFresh = _consoleViewportVisible && _consoleViewportPhysW > 0 && _consoleViewportUpdatedMs > 0 && (vpNowMs - _consoleViewportUpdatedMs) <= 10000;
                             snapConsoleVis = vpFresh;
@@ -5393,7 +5553,7 @@ namespace AgyBackdropCompanion
                         if (cdpTakesHud || snapHwnds.Count == 0)
                         {
                             prevMouseDownOnHost = false;
-                            try { _uiaWakeEvent.WaitOne(500); } catch { Thread.Sleep(500); }
+                            try { _uiaWakeEvent.WaitOne(1000); } catch { Thread.Sleep(1000); }
                             continue;
                         }
 
@@ -5406,59 +5566,66 @@ namespace AgyBackdropCompanion
                             if (isFgTracked) lastInputUtc = loopNow;
                         }
 
-                        Native.POINT curPt;
-                        if (Native.GetCursorPos(out curPt))
+                        if (hudWantActive)
                         {
-                            if (!hasPrevCursor || curPt.X != prevCursorPt.X || curPt.Y != prevCursorPt.Y)
+                            Native.POINT curPt;
+                            if (Native.GetCursorPos(out curPt))
                             {
-                                prevCursorPt = curPt;
-                                hasPrevCursor = true;
-                                if (isFgTracked) lastInputUtc = loopNow;
-                            }
-                        }
-
-                        bool leftButtonDown = (Native.GetAsyncKeyState(Native.VK_LBUTTON) & 0x8000) != 0;
-                        mouseDownOnHost = isFgTracked && leftButtonDown;
-                        clickJustReleased = prevMouseDownOnHost && !mouseDownOnHost;
-
-                        // Detect Enter / Backspace typing activity so multiline composer height changes follow immediately
-                        if (isFgTracked && !mouseDownOnHost)
-                        {
-                            bool enterDown = (Native.GetAsyncKeyState(Native.VK_RETURN) & 0x8001) != 0;
-                            bool backDown = (Native.GetAsyncKeyState(Native.VK_BACK) & 0x8001) != 0;
-                            if (enterDown || backDown)
-                            {
-                                typingNewlineKey = true;
-                                lastInputUtc = loopNow;
-                                DateTime typeBoost = loopNow.AddMilliseconds(450);
-                                if (typeBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = typeBoost;
-                            }
-                        }
-
-                        if (mouseDownOnHost)
-                        {
-                            lastInputUtc = loopNow;
-                            DateTime boost = loopNow.AddMilliseconds(450);
-                            if (boost > _fastTrackUntilUtc) _fastTrackUntilUtc = boost;
-                        }
-                        else if (clickJustReleased)
-                        {
-                            lastInputUtc = loopNow;
-                            DateTime postBoost = loopNow.AddMilliseconds(600);
-                            if (postBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = postBoost;
-                            // Defer breadcrumb probe ~220ms so Electron finishes rendering the newly selected conversation header
-                            Native.RECT fgRect;
-                            if (hasPrevCursor && fgHwnd != IntPtr.Zero && Native.TryGetVisibleBounds(fgHwnd, out fgRect))
-                            {
-                                double fgDpi = Native.GetWindowDpiScale(fgHwnd);
-                                if (prevCursorPt.X < fgRect.Left + (int)Math.Round(360 * fgDpi) || prevCursorPt.Y < fgRect.Top + (int)Math.Round(110 * fgDpi))
+                                if (!hasPrevCursor || curPt.X != prevCursorPt.X || curPt.Y != prevCursorPt.Y)
                                 {
-                                    _pendingViewProbeAtUtc = loopNow.AddMilliseconds(220);
+                                    prevCursorPt = curPt;
+                                    hasPrevCursor = true;
+                                    if (isFgTracked) lastInputUtc = loopNow;
                                 }
                             }
+
+                            bool leftButtonDown = (Native.GetAsyncKeyState(Native.VK_LBUTTON) & 0x8000) != 0;
+                            mouseDownOnHost = isFgTracked && leftButtonDown;
+                            clickJustReleased = prevMouseDownOnHost && !mouseDownOnHost;
+
+                            // Detect Enter / Backspace typing activity so multiline composer height changes follow immediately
+                            if (isFgTracked && !mouseDownOnHost)
+                            {
+                                bool enterDown = (Native.GetAsyncKeyState(Native.VK_RETURN) & 0x8001) != 0;
+                                bool backDown = (Native.GetAsyncKeyState(Native.VK_BACK) & 0x8001) != 0;
+                                if (enterDown || backDown)
+                                {
+                                    typingNewlineKey = true;
+                                    lastInputUtc = loopNow;
+                                    DateTime typeBoost = loopNow.AddMilliseconds(450);
+                                    if (typeBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = typeBoost;
+                                }
+                            }
+
+                            if (mouseDownOnHost)
+                            {
+                                lastInputUtc = loopNow;
+                                DateTime boost = loopNow.AddMilliseconds(450);
+                                if (boost > _fastTrackUntilUtc) _fastTrackUntilUtc = boost;
+                            }
+                            else if (clickJustReleased)
+                            {
+                                lastInputUtc = loopNow;
+                                DateTime postBoost = loopNow.AddMilliseconds(600);
+                                if (postBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = postBoost;
+                                // Defer breadcrumb probe ~220ms so Electron finishes rendering the newly selected conversation header
+                                Native.RECT fgRect;
+                                if (hasPrevCursor && fgHwnd != IntPtr.Zero && Native.TryGetVisibleBounds(fgHwnd, out fgRect))
+                                {
+                                    double fgDpi = Native.GetWindowDpiScale(fgHwnd);
+                                    if (prevCursorPt.X < fgRect.Left + (int)Math.Round(360 * fgDpi) || prevCursorPt.Y < fgRect.Top + (int)Math.Round(110 * fgDpi))
+                                    {
+                                        _pendingViewProbeAtUtc = loopNow.AddMilliseconds(220);
+                                    }
+                                }
+                            }
+                            prevMouseDownOnHost = mouseDownOnHost;
+                            userActiveNow = isFgTracked && ((loopNow - lastInputUtc).TotalMilliseconds < 700.0 || loopNow < _fastTrackUntilUtc);
                         }
-                        prevMouseDownOnHost = mouseDownOnHost;
-                        userActiveNow = isFgTracked && ((loopNow - lastInputUtc).TotalMilliseconds < 700.0 || loopNow < _fastTrackUntilUtc);
+                        else
+                        {
+                            prevMouseDownOnHost = false;
+                        }
 
                         bool pendingDue = loopNow >= _pendingViewProbeAtUtc;
                         bool explicitViewTrigger = _forceViewProbe || pendingDue;
@@ -5485,7 +5652,7 @@ namespace AgyBackdropCompanion
                             IntPtr backdropHwnd = snapBackdropHwnd[idx];
 
                             double rescanCooldownMs = clickJustReleased ? 220.0 : (mouseDownOnHost ? 320.0 : (isFgTracked ? 1200.0 : 4000.0));
-                            bool canProbeAnchor = useZeroUia || cachedEl != null || (loopNow - lastScan).TotalMilliseconds >= rescanCooldownMs;
+                            bool canProbeAnchor = hudWantActive && (useZeroUia || cachedEl != null || (loopNow - lastScan).TotalMilliseconds >= rescanCooldownMs);
                             if (canProbeAnchor)
                             {
                                 bool hadCached = cachedEl != null;
@@ -5719,8 +5886,9 @@ namespace AgyBackdropCompanion
                     catch { }
 
                     int waitMs;
-                    if (mouseDownOnHost || typingNewlineKey) waitMs = 32;
-                    else if (userActiveNow) waitMs = 120;
+                    if (!hudWantActive) waitMs = 2000;
+                    else if (mouseDownOnHost || typingNewlineKey) waitMs = useZeroUia ? 250 : 32;
+                    else if (userActiveNow) waitMs = useZeroUia ? 250 : 120;
                     else if (!isFgTracked) waitMs = 600;
                     else if (anyOccluded) waitMs = 240;
                     else waitMs = 500;
@@ -5874,23 +6042,72 @@ namespace AgyBackdropCompanion
         private void InstallHooks()
         {
             _winEventDelegate = OnWinEvent;
-            uint[] eventsToHook = new uint[]
-            {
+            uint flags = Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS;
+            IntPtr fgHook = Native.SetWinEventHook(
                 Native.EVENT_SYSTEM_FOREGROUND,
+                Native.EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero,
+                _winEventDelegate,
+                0,
+                0,
+                flags
+            );
+            if (fgHook != IntPtr.Zero) _hooks.Add(fgHook);
+            SyncHostPidHooks();
+        }
+
+        private void SyncHostPidHooks()
+        {
+            if (_disposed || _winEventDelegate == null) return;
+            var activePids = new HashSet<uint>();
+            foreach (IntPtr hwnd in _tracked.Keys)
+            {
+                if (!Native.IsWindow(hwnd)) continue;
+                uint pid = 0;
+                Native.GetWindowThreadProcessId(hwnd, out pid);
+                if (pid != 0 && pid != (uint)_selfPid)
+                {
+                    activePids.Add(pid);
+                }
+            }
+
+            var stalePids = new List<uint>();
+            foreach (uint pid in _hostPidHooks.Keys)
+            {
+                if (!activePids.Contains(pid)) stalePids.Add(pid);
+            }
+            for (int i = 0; i < stalePids.Count; i++)
+            {
+                uint pid = stalePids[i];
+                List<IntPtr> list;
+                if (_hostPidHooks.TryGetValue(pid, out list))
+                {
+                    for (int j = 0; j < list.Count; j++)
+                    {
+                        try { Native.UnhookWinEvent(list[j]); } catch { }
+                    }
+                    _hostPidHooks.Remove(pid);
+                }
+            }
+
+            uint[] hostEvents = new uint[]
+            {
                 Native.EVENT_SYSTEM_MOVESIZESTART,
                 Native.EVENT_SYSTEM_MOVESIZEEND,
                 Native.EVENT_SYSTEM_MINIMIZESTART,
-                Native.EVENT_SYSTEM_MINIMIZEEND,
-                Native.EVENT_OBJECT_LOCATIONCHANGE,
-                Native.EVENT_OBJECT_REORDER,
-                Native.EVENT_OBJECT_SHOW,
-                Native.EVENT_OBJECT_HIDE,
-                Native.EVENT_OBJECT_DESTROY
+                Native.EVENT_SYSTEM_MINIMIZEEND
             };
-            foreach (uint ev in eventsToHook)
+            uint flags = Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS;
+            foreach (uint pid in activePids)
             {
-                IntPtr h = Native.SetWinEventHook(ev, ev, IntPtr.Zero, _winEventDelegate, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
-                if (h != IntPtr.Zero) _hooks.Add(h);
+                if (_hostPidHooks.ContainsKey(pid)) continue;
+                var pidHooks = new List<IntPtr>(hostEvents.Length);
+                for (int i = 0; i < hostEvents.Length; i++)
+                {
+                    IntPtr h = Native.SetWinEventHook(hostEvents[i], hostEvents[i], IntPtr.Zero, _winEventDelegate, pid, 0, flags);
+                    if (h != IntPtr.Zero) pidHooks.Add(h);
+                }
+                _hostPidHooks[pid] = pidHooks;
             }
         }
 
@@ -5900,36 +6117,32 @@ namespace AgyBackdropCompanion
             if (_disposed || hwnd == IntPtr.Zero || idObject != 0 || idChild != 0) return;
 
             bool isTracked = _tracked.ContainsKey(hwnd);
-            if (eventType == Native.EVENT_OBJECT_REORDER)
+            if (eventType == Native.EVENT_OBJECT_LOCATIONCHANGE && isTracked)
             {
-                if (_tracked.Count > 0 && !_inSync)
+                TrackedHostWindow locItem;
+                Native.RECT lr;
+                if (!_tracked.TryGetValue(hwnd, out locItem) || !Native.TryGetVisibleBounds(hwnd, out lr))
                 {
-                    DateTime nowUtc = DateTime.UtcNow;
-                    if ((nowUtc - _lastReorderSyncUtc).TotalMilliseconds < 80.0) return;
-                    bool needsZFix = false;
-                    foreach (TrackedHostWindow item in _tracked.Values)
-                    {
-                        if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero &&
-                            Native.IsWindow(item.Hwnd) && Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd))
-                        {
-                            Native.RECT hr;
-                            string blk;
-                            if (Native.TryGetVisibleBounds(item.Hwnd, out hr) &&
-                                !Native.IsDirectlyBehindVisible(item.Backdrop.Handle, item.Hwnd, hr, out blk))
-                            {
-                                needsZFix = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (needsZFix)
-                    {
-                        _lastReorderSyncUtc = nowUtc;
-                        if (_debounceTimer != null && !_debounceTimer.IsEnabled)
-                        {
-                            _debounceTimer.Start();
-                        }
-                    }
+                    return;
+                }
+                int lw = Math.Max(1, lr.Right - lr.Left);
+                int lh = Math.Max(1, lr.Bottom - lr.Top);
+                if (locItem.BackdropVisible && lr.Left == locItem.LastLeft && lr.Top == locItem.LastTop && lw == locItem.LastWidth && lh == locItem.LastHeight)
+                {
+                    return;
+                }
+                if (hwnd == _moveSizingHwnd)
+                {
+                    _renderFollowLastRect = lr;
+                    _renderFollowLastChangeUtc = DateTime.UtcNow;
+                }
+                if (eventType == Native.EVENT_OBJECT_LOCATIONCHANGE && isTracked && !_inSync)
+                {
+                    SyncAllWindows(false);
+                }
+                else
+                {
+                    _syncPending = true;
                 }
                 return;
             }
@@ -5994,12 +6207,20 @@ namespace AgyBackdropCompanion
                 }
 
                 bool probeView = eventType == Native.EVENT_SYSTEM_FOREGROUND || eventType == Native.EVENT_SYSTEM_MOVESIZEEND;
-                TriggerFastUiaBurst(550, probeView);
-                if (eventType == Native.EVENT_OBJECT_LOCATIONCHANGE && isTracked && !_inSync)
+                bool hudWantActive = _config != null && _config.hudEnabled && _hudEnabledByTray && !_pausedByTray;
+                if (hudWantActive)
                 {
-                    SyncAllWindows(false);
+                    TriggerFastUiaBurst(550, probeView);
                 }
-                else if (!_inSync && (eventType == Native.EVENT_SYSTEM_FOREGROUND || eventType == Native.EVENT_SYSTEM_MINIMIZEEND || eventType == Native.EVENT_OBJECT_SHOW || eventType == Native.EVENT_SYSTEM_MOVESIZEEND))
+                else if (probeView)
+                {
+                    _forceViewProbe = true;
+                }
+                if (eventType == Native.EVENT_SYSTEM_FOREGROUND && isTracked)
+                {
+                    SetFastStateIntervalMs(150);
+                }
+                if (!_inSync && (eventType == Native.EVENT_SYSTEM_FOREGROUND || eventType == Native.EVENT_SYSTEM_MINIMIZEEND || eventType == Native.EVENT_OBJECT_SHOW || eventType == Native.EVENT_SYSTEM_MOVESIZEEND))
                 {
                     SyncAllWindows(false);
                 }
@@ -6909,6 +7130,11 @@ namespace AgyBackdropCompanion
 
                 next.wallpaperPath = ResolveWallpaperPath(next.activeWallpaperId, doc);
                 _config = next;
+                _hudEnabledByTray = next.hudEnabled;
+                if (_hudMenuItem != null)
+                {
+                    _hudMenuItem.Checked = next.hudEnabled;
+                }
                 _configVersion++;
                 foreach (TrackedHostWindow tItem in _tracked.Values)
                 {
@@ -6954,6 +7180,35 @@ namespace AgyBackdropCompanion
                         item.Hud.UpdateData(ResolveTelemetryForWindow(item), _config.accentColor);
                     }
                 }
+            }
+            catch { }
+        }
+
+        private void PersistHudEnabledToThemesFile(bool enabled)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_themesPath) || !File.Exists(_themesPath)) return;
+                string raw = ReadTextWithRetry(_themesPath);
+                if (string.IsNullOrEmpty(raw)) return;
+                var doc = _json.DeserializeObject(raw) as Dictionary<string, object>;
+                if (doc == null) return;
+                doc["hudEnabled"] = enabled;
+                var localJson = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
+                string tmp = _themesPath + ".tmp." + _selfPid.ToString(CultureInfo.InvariantCulture);
+                File.WriteAllText(tmp, localJson.Serialize(doc), new UTF8Encoding(false));
+                try
+                {
+                    File.Replace(tmp, _themesPath, null);
+                }
+                catch
+                {
+                    File.Copy(tmp, _themesPath, true);
+                    try { File.Delete(tmp); } catch { }
+                }
+                var info = new FileInfo(_themesPath);
+                _lastThemesWriteUtc = info.LastWriteTimeUtc;
+                _lastThemesLength = info.Length;
             }
             catch { }
         }
@@ -7370,6 +7625,7 @@ namespace AgyBackdropCompanion
                     }
 
                     SweepOrphanedWindows();
+                    SyncHostPidHooks();
                 }
 
                 bool wantBackdrop = IsBackdropEffectWanted();
@@ -7712,14 +7968,7 @@ namespace AgyBackdropCompanion
                 string procName;
                 if (!pidCache.TryGetValue(pid, out procName))
                 {
-                    try
-                    {
-                        using (Process proc = Process.GetProcessById((int)pid))
-                        {
-                            procName = proc.ProcessName;
-                        }
-                    }
-                    catch { procName = ""; }
+                    procName = Native.GetProcessBaseNameFast(pid);
                     pidCache[pid] = procName;
                 }
                 if (!IsAntigravityHostProcessName(procName)) return true;
@@ -7958,15 +8207,25 @@ namespace AgyBackdropCompanion
             _disposed = true;
 
             try { StopRenderFollow(); } catch { }
+            DetachDragLocationHook();
             try { UninstallSystemEvents(); } catch { }
             try { if (_debounceTimer != null) _debounceTimer.Stop(); } catch { }
             try { if (_reconcileTimer != null) _reconcileTimer.Stop(); } catch { }
+            try { if (_fastStateTimer != null) _fastStateTimer.Stop(); } catch { }
             try { if (_watcher != null) _watcher.Dispose(); } catch { }
             foreach (IntPtr h in _hooks)
             {
                 try { Native.UnhookWinEvent(h); } catch { }
             }
             _hooks.Clear();
+            foreach (List<IntPtr> pidList in _hostPidHooks.Values)
+            {
+                for (int i = 0; i < pidList.Count; i++)
+                {
+                    try { Native.UnhookWinEvent(pidList[i]); } catch { }
+                }
+            }
+            _hostPidHooks.Clear();
 
             foreach (TrackedHostWindow item in _tracked.Values)
             {

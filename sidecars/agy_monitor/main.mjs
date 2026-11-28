@@ -2327,6 +2327,7 @@ export function createMonitorHandlers({
       if (!patch.hudInjectionMode) patch.hudInjectionMode = 'asar';
     } else if (action === 'restore') {
       const curThemes = await store.getThemes();
+      patch.hudEnabled = false;
       if (!patch.hudInjectionMode) patch.hudInjectionMode = 'uia';
       patch.hudAutoReinject = false;
       if (curThemes.hostThemeMode === 'inject') {
@@ -3317,12 +3318,12 @@ export async function startSidecarServer({
           themes.activeWallpaperId &&
           (themes.hostThemeMode === 'inject' || !themes.hostThemeMode),
       );
-      const wantNativeProxy = prefs.proxy?.enabled !== false;
+      const wantNativeProxy = Boolean(prefs.proxy?.enabled);
 
-      await stageLiveHudAssets(paths, themesWithLite, { liteMode }).catch(() => {});
       if (!wantNativeHud && !wantNativeWallpaper && !wantNativeProxy) {
         return;
       }
+      await stageLiveHudAssets(paths, themesWithLite, { liteMode }).catch(() => {});
 
       if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper || wantNativeProxy)) {
         const st = await inspectNativeHudState(paths).catch(() => null);
@@ -3417,13 +3418,13 @@ export async function startSidecarServer({
       }
     })();
 
-    sharedAccountManager.startLifecycleWatcher({ intervalMs: 2000 });
+    sharedAccountManager.startLifecycleWatcher({ intervalMs: 5000 });
     sharedMemoryManager.startAutoGuard();
 
     companionWatchdogTimer = setInterval(() => {
       void ensureNativeHudHealthy();
       void ensureCompanionHealthy();
-    }, 15_000);
+    }, 30_000);
     companionWatchdogTimer.unref?.();
   }
 

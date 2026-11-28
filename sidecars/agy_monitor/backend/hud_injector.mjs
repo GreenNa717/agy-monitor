@@ -1322,19 +1322,24 @@ export function buildNativeWallpaperEngineScript() {
         return 0;
       }
 
+      var isWpComposing = false;
+      var onWpCompStart = function () { isWpComposing = true; };
+      var onWpCompEnd = function () { isWpComposing = false; };
+      window.addEventListener('compositionstart', onWpCompStart, true);
+      window.addEventListener('compositionend', onWpCompEnd, true);
+
       function scanLayers() {
-        if (document.hidden) return 0;
+        if (document.hidden || isWpComposing) return 0;
         var vw = window.innerWidth || 0;
         var vh = window.innerHeight || 0;
         if (vw < 300 || vh < 200) return 0;
         var xs = [
-          12, Math.min(44, Math.floor(vw * 0.04)), Math.floor(vw * 0.12), Math.floor(vw * 0.26),
-          Math.floor(vw * 0.42), Math.floor(vw * 0.58), Math.floor(vw * 0.74), Math.floor(vw * 0.88),
-          Math.max(0, vw - 16)
+          12, Math.floor(vw * 0.14), Math.floor(vw * 0.34),
+          Math.floor(vw * 0.56), Math.floor(vw * 0.78), Math.max(0, vw - 16)
         ];
         var ys = [
-          12, 44, 84, Math.floor(vh * 0.18), Math.floor(vh * 0.34), Math.floor(vh * 0.52),
-          Math.floor(vh * 0.70), Math.floor(vh * 0.85), Math.max(0, vh - 14)
+          16, 64, Math.floor(vh * 0.28), Math.floor(vh * 0.52),
+          Math.floor(vh * 0.76), Math.max(0, vh - 16)
         ];
         var seen = new Set();
         var tagged = 0;
@@ -1375,7 +1380,7 @@ export function buildNativeWallpaperEngineScript() {
       }
 
       var MUT_THROTTLE_MS = 350;
-      var timer = setInterval(scanLayers, 1100);
+      var timer = setInterval(scanLayers, 3000);
       var resizeTimer = null;
       var onResize = function () {
         if (document.hidden) return;
@@ -1388,28 +1393,43 @@ export function buildNativeWallpaperEngineScript() {
       window.addEventListener('resize', onResize, { passive: true });
 
       var mutTimer = null;
+      var mutIdleId = 0;
       var mutPending = false;
       var lastMutScanAt = 0;
-      function flushMutScan() {
-        mutTimer = null;
-        if (document.hidden) {
+      function runDeferredMutScan() {
+        mutIdleId = 0;
+        if (document.hidden || isWpComposing) {
           mutPending = true;
           return;
         }
         mutPending = false;
         lastMutScanAt = Date.now();
         scanLayers();
-        if (mutPending && !mutTimer) {
+        if (mutPending && !mutTimer && !mutIdleId) {
           mutTimer = setTimeout(flushMutScan, MUT_THROTTLE_MS);
         }
       }
+      function flushMutScan() {
+        mutTimer = null;
+        if (document.hidden || isWpComposing) {
+          mutPending = true;
+          return;
+        }
+        if (typeof requestIdleCallback === 'function') {
+          if (!mutIdleId) {
+            mutIdleId = requestIdleCallback(runDeferredMutScan, { timeout: 600 });
+          }
+          return;
+        }
+        runDeferredMutScan();
+      }
       function scheduleMutScan() {
-        if (document.hidden) {
+        if (document.hidden || isWpComposing) {
           mutPending = true;
           return;
         }
         mutPending = true;
-        if (mutTimer) return;
+        if (mutTimer || mutIdleId) return;
         var elapsed = Date.now() - lastMutScanAt;
         var wait = elapsed >= MUT_THROTTLE_MS ? MUT_THROTTLE_MS : Math.max(50, MUT_THROTTLE_MS - elapsed);
         mutTimer = setTimeout(flushMutScan, wait);
@@ -1420,6 +1440,11 @@ export function buildNativeWallpaperEngineScript() {
           if (mutTimer) {
             clearTimeout(mutTimer);
             mutTimer = null;
+            mutPending = true;
+          }
+          if (mutIdleId && typeof cancelIdleCallback === 'function') {
+            cancelIdleCallback(mutIdleId);
+            mutIdleId = 0;
             mutPending = true;
           }
           if (resizeTimer) {
@@ -1435,8 +1460,22 @@ export function buildNativeWallpaperEngineScript() {
       document.addEventListener('visibilitychange', onVisibilityChange);
 
       var layerObserver = null;
+      var COMPOSER_SKIP_SEL = 'textarea,input,[contenteditable="true"],.surface-composer,.surface-composer-card';
       if (typeof MutationObserver === 'function' && document.body) {
-        layerObserver = new MutationObserver(function () {
+        layerObserver = new MutationObserver(function (muts) {
+          if (isWpComposing) return;
+          if (Array.isArray(muts) && muts.length > 0) {
+            var hasOuterMutation = false;
+            for (var mi = 0; mi < muts.length; mi++) {
+              var tgt = muts[mi] && muts[mi].target;
+              var el = tgt && tgt.nodeType === 1 ? tgt : (tgt && tgt.parentElement);
+              if (!el || !el.closest || !el.closest(COMPOSER_SKIP_SEL)) {
+                hasOuterMutation = true;
+                break;
+              }
+            }
+            if (!hasOuterMutation) return;
+          }
           scheduleMutScan();
         });
         layerObserver.observe(document.body, { childList: true, subtree: true });
@@ -1449,9 +1488,12 @@ export function buildNativeWallpaperEngineScript() {
         stop: function () {
           clearInterval(timer);
           if (mutTimer) { clearTimeout(mutTimer); mutTimer = null; }
+          if (mutIdleId && typeof cancelIdleCallback === 'function') { cancelIdleCallback(mutIdleId); mutIdleId = 0; }
           if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
           mutPending = false;
           if (layerObserver) { layerObserver.disconnect(); layerObserver = null; }
+          window.removeEventListener('compositionstart', onWpCompStart, true);
+          window.removeEventListener('compositionend', onWpCompEnd, true);
           window.removeEventListener('resize', onResize);
           document.removeEventListener('visibilitychange', onVisibilityChange);
           var nodes = document.querySelectorAll('[data-agy-mon-layer]');
@@ -2752,12 +2794,18 @@ export function buildNativeHudRendererScript() {
   document.addEventListener('keydown', onKeyDown, true);
   window.addEventListener('resize', onResize);
 
+  var isHudComposing = false;
+  var onHudCompStart = function () { isHudComposing = true; };
+  var onHudCompEnd = function () { isHudComposing = false; };
+  window.addEventListener('compositionstart', onHudCompStart, true);
+  window.addEventListener('compositionend', onHudCompEnd, true);
+
   // Self-healing DOM & theme observers
   var rafId = 0;
   var domObs = null;
   if (typeof MutationObserver === 'function' && document.body) {
     domObs = new MutationObserver(function () {
-      if (state.disposed) return;
+      if (state.disposed || isHudComposing) return;
       if (!host.isConnected) {
         if (!rafId) {
           rafId = requestAnimationFrame(function () {
@@ -2793,7 +2841,7 @@ export function buildNativeHudRendererScript() {
     if (!host.isConnected) {
       if (ensureDocked()) render();
     }
-  }, 600);
+  }, 2000);
 
   function disposeSelf() {
     if (state.disposed) return;
@@ -2804,6 +2852,8 @@ export function buildNativeHudRendererScript() {
     try { if (domObs) domObs.disconnect(); } catch (e) {}
     try { if (themeObs) themeObs.disconnect(); } catch (e) {}
     try { if (footerResizeObs) footerResizeObs.disconnect(); } catch (e) {}
+    window.removeEventListener('compositionstart', onHudCompStart, true);
+    window.removeEventListener('compositionend', onHudCompEnd, true);
     document.removeEventListener('mousedown', onDocClick, true);
     document.removeEventListener('keydown', onKeyDown, true);
     window.removeEventListener('resize', onResize);

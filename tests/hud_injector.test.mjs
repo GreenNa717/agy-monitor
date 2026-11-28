@@ -329,11 +329,12 @@ test('hud_injector: embedded scripts are valid JS, support Scheme 3 persistent w
     assert.equal(statusRes.config.hudInjectionMode, 'asar');
     assert.equal(statusRes.nativeHud.state, 'installed');
 
-    // Restore stock restores app.asar, switches hostThemeMode off inject, and clears staged CSS
+    // Restore stock restores app.asar, switches hostThemeMode off inject, disables HUD, and clears staged CSS
     const restoreRes = await installHandler({ action: 'restore' });
     assert.equal(restoreRes.ok, true);
     assert.equal(restoreRes.nativeHud.state, 'stock');
     assert.equal(restoreRes.themeState.hostThemeMode, 'backdrop');
+    assert.equal(restoreRes.themeState.hudEnabled, false);
     assert.equal(fs.readFileSync(paths.nativeWallpaperCssFile, 'utf8'), '');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1182,4 +1183,108 @@ test('hud_injector: queues deferred exit-apply when app.asar rename is EBUSY and
     fsp.rename = origRename;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('hud_injector: layer engine & native HUD guard against IME composition and ignore composer-internal mutations', () => {
+  const wallpaperSrc = buildNativeWallpaperEngineScript();
+  const rendererSrc = buildNativeHudRendererScript();
+
+  assert.match(wallpaperSrc, /compositionstart/);
+  assert.match(wallpaperSrc, /compositionend/);
+  assert.match(wallpaperSrc, /requestIdleCallback/);
+  assert.match(rendererSrc, /compositionstart/);
+  assert.match(rendererSrc, /compositionend/);
+
+  let elementsFromPointCalls = 0;
+  let mutCallback = null;
+  let nextTimerId = 1;
+  const timeouts = new Map();
+  const winListeners = new Map();
+  const docListeners = new Map();
+  const styleEl = { id: 'agy-monitor-cdp-theme', textContent: '', parentNode: null };
+  const headEl = { appendChild(el) { el.parentNode = headEl; } };
+
+  const fakeDoc = {
+    hidden: false,
+    head: headEl,
+    body: { tagName: 'BODY' },
+    documentElement: headEl,
+    getElementById: (id) => (id === styleEl.id && styleEl.parentNode ? styleEl : null),
+    createElement: () => styleEl,
+    elementsFromPoint: () => {
+      elementsFromPointCalls += 1;
+      return [];
+    },
+    querySelectorAll: () => [],
+    addEventListener: (evt, fn) => {
+      if (!docListeners.has(evt)) docListeners.set(evt, new Set());
+      docListeners.get(evt).add(fn);
+    },
+    removeEventListener: (evt, fn) => {
+      docListeners.get(evt)?.delete(fn);
+    },
+  };
+
+  class FakeMutationObserver {
+    constructor(cb) {
+      mutCallback = cb;
+    }
+    observe() {}
+    disconnect() {}
+  }
+
+  const fakeWin = {
+    innerWidth: 1280,
+    innerHeight: 800,
+    document: fakeDoc,
+    MutationObserver: FakeMutationObserver,
+    Set,
+    Array,
+    Math,
+    Date: { now: () => 5000 },
+    setTimeout: (fn, delay) => {
+      const id = nextTimerId++;
+      timeouts.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id) => timeouts.delete(id),
+    setInterval: () => nextTimerId++,
+    clearInterval: () => {},
+    addEventListener: (evt, fn) => {
+      if (!winListeners.has(evt)) winListeners.set(evt, new Set());
+      winListeners.get(evt).add(fn);
+    },
+    removeEventListener: (evt, fn) => {
+      winListeners.get(evt)?.delete(fn);
+    },
+  };
+  fakeWin.window = fakeWin;
+
+  vm.createContext(fakeWin);
+  vm.runInContext(wallpaperSrc, fakeWin);
+  fakeWin.__agyMonitorWallpaper.apply('html { color: #fff; }');
+
+  // 1. Composer-internal mutations do NOT schedule layer scans
+  timeouts.clear();
+  elementsFromPointCalls = 0;
+  const composerNode = {
+    nodeType: 1,
+    closest: (sel) => (sel.includes('.surface-composer') ? {} : null),
+  };
+  mutCallback([{ target: composerNode }]);
+  assert.equal(timeouts.size, 0, 'composer-internal mutations must not schedule layer scans');
+
+  // 2. Active IME composition blocks scanLayers and MutationObserver scheduling
+  for (const fn of winListeners.get('compositionstart') || []) fn();
+  assert.equal(fakeWin.__agyMonLayerEngine.scan(), 0);
+  assert.equal(elementsFromPointCalls, 0);
+  const outerNode = { nodeType: 1, closest: () => null };
+  mutCallback([{ target: outerNode }]);
+  assert.equal(timeouts.size, 0, 'IME composition must block MutationObserver layer scans');
+  for (const fn of winListeners.get('compositionend') || []) fn();
+
+  // 3. stop() cleans up composition listeners cleanly
+  fakeWin.__agyMonLayerEngine.stop();
+  assert.equal((winListeners.get('compositionstart') || new Set()).size, 0);
+  assert.equal((winListeners.get('compositionend') || new Set()).size, 0);
 });
