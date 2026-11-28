@@ -1324,9 +1324,14 @@ export function buildNativeWallpaperEngineScript() {
 
       var isWpComposing = false;
       var onWpCompStart = function () { isWpComposing = true; };
-      var onWpCompEnd = function () { isWpComposing = false; };
+      var onWpCompEnd = function () {
+        if (!isWpComposing) return;
+        isWpComposing = false;
+        if (mutPending) scheduleMutScan();
+      };
       window.addEventListener('compositionstart', onWpCompStart, true);
       window.addEventListener('compositionend', onWpCompEnd, true);
+      window.addEventListener('blur', onWpCompEnd);
 
       function scanLayers() {
         if (document.hidden || isWpComposing) return 0;
@@ -1494,6 +1499,7 @@ export function buildNativeWallpaperEngineScript() {
           if (layerObserver) { layerObserver.disconnect(); layerObserver = null; }
           window.removeEventListener('compositionstart', onWpCompStart, true);
           window.removeEventListener('compositionend', onWpCompEnd, true);
+          window.removeEventListener('blur', onWpCompEnd);
           window.removeEventListener('resize', onResize);
           document.removeEventListener('visibilitychange', onVisibilityChange);
           var nodes = document.querySelectorAll('[data-agy-mon-layer]');
@@ -2799,6 +2805,7 @@ export function buildNativeHudRendererScript() {
   var onHudCompEnd = function () { isHudComposing = false; };
   window.addEventListener('compositionstart', onHudCompStart, true);
   window.addEventListener('compositionend', onHudCompEnd, true);
+  window.addEventListener('blur', onHudCompEnd);
 
   // Self-healing DOM & theme observers
   var rafId = 0;
@@ -2854,6 +2861,7 @@ export function buildNativeHudRendererScript() {
     try { if (footerResizeObs) footerResizeObs.disconnect(); } catch (e) {}
     window.removeEventListener('compositionstart', onHudCompStart, true);
     window.removeEventListener('compositionend', onHudCompEnd, true);
+    window.removeEventListener('blur', onHudCompEnd);
     document.removeEventListener('mousedown', onDocClick, true);
     document.removeEventListener('keydown', onKeyDown, true);
     window.removeEventListener('resize', onResize);

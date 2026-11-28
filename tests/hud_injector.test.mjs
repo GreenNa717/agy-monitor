@@ -1283,8 +1283,16 @@ test('hud_injector: layer engine & native HUD guard against IME composition and 
   assert.equal(timeouts.size, 0, 'IME composition must block MutationObserver layer scans');
   for (const fn of winListeners.get('compositionend') || []) fn();
 
-  // 3. stop() cleans up composition listeners cleanly
+  // 2b. Window blur also resets composition state so Alt-Tab mid-IME cannot stall scans
+  for (const fn of winListeners.get('compositionstart') || []) fn();
+  assert.equal(fakeWin.__agyMonLayerEngine.scan(), 0);
+  for (const fn of winListeners.get('blur') || []) fn();
+  fakeWin.__agyMonLayerEngine.scan();
+  assert.ok(elementsFromPointCalls > 0, 'blur must reset stuck IME composition guard');
+
+  // 3. stop() cleans up composition & blur listeners cleanly
   fakeWin.__agyMonLayerEngine.stop();
   assert.equal((winListeners.get('compositionstart') || new Set()).size, 0);
   assert.equal((winListeners.get('compositionend') || new Set()).size, 0);
+  assert.equal((winListeners.get('blur') || new Set()).size, 0);
 });

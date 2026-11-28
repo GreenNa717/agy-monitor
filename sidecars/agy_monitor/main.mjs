@@ -3318,14 +3318,15 @@ export async function startSidecarServer({
           themes.activeWallpaperId &&
           (themes.hostThemeMode === 'inject' || !themes.hostThemeMode),
       );
-      const wantNativeProxy = Boolean(prefs.proxy?.enabled);
+      const wantNativeProxy = prefs.proxy?.enabled !== false;
+      const wantHostI18n = prefs.language !== 'en';
 
-      if (!wantNativeHud && !wantNativeWallpaper && !wantNativeProxy) {
+      if (!wantNativeHud && !wantNativeWallpaper && !wantNativeProxy && !wantHostI18n) {
         return;
       }
       await stageLiveHudAssets(paths, themesWithLite, { liteMode }).catch(() => {});
 
-      if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper || wantNativeProxy)) {
+      if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper || wantNativeProxy || wantHostI18n)) {
         const st = await inspectNativeHudState(paths).catch(() => null);
         if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
           const now = Date.now();
